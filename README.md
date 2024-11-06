@@ -1,4 +1,4 @@
-# Don't Mesh Around
+# Don't Mesh Around ARM
 
 This repository contains the code to reproduce the experiments from [*Don't Mesh Around: Side-Channel Attacks and Mitigations on Mesh Interconnects*](https://www.usenix.org/conference/usenixsecurity22/presentation/dai) **(USENIX 2022)**.
 
