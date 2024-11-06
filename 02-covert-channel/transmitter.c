@@ -3,7 +3,6 @@
 #include <semaphore.h>
 #include <sys/mman.h>
 #include <string.h>
-#include <x86intrin.h>
 
 #define BUF_SIZE 400 * 1024UL * 1024 /* Buffer Size -> 400*1MB */
 
@@ -21,16 +20,16 @@ int main(int argc, char **argv)
 	// Parse core ID
 	int core_ID;
 	sscanf(argv[1], "%d", &core_ID);
-	if (core_ID > NUM_CORES_PER_SOCKET - 1 || core_ID < 0) {
-		fprintf(stderr, "Wrong core! core_ID should be less than %d and more than 0!\n", NUM_CORES_PER_SOCKET);
+	if (core_ID > NUM_CORES - 1 || core_ID < 0) {
+		fprintf(stderr, "Wrong core! core_ID should be less than %d and more than 0!\n", NUM_CORES);
 		exit(1);
 	}
 
 	// Parse slice number
 	int slice_ID;
 	sscanf(argv[2], "%d", &slice_ID);
-	if (slice_ID > NUM_CHA - 1 || slice_ID < 0) {
-		fprintf(stderr, "Wrong slice! slice_ID should be less than %d and more than 0!\n", LLC_CACHE_SLICES);
+	if (slice_ID > NUM_CORES - 1 || slice_ID < 0) {
+		fprintf(stderr, "Wrong slice! slice_ID should be less than %d and more than 0!\n", NUM_CORES);
 		exit(1);
 	}
 
@@ -47,8 +46,7 @@ int main(int argc, char **argv)
 	// This time we do not set the priority like in the RE because
 	// doing so would use root and we want our actual attack
 	// to be realistic for a user space process
-	int cpu = cha_id_to_cpu[core_ID];
-	pin_cpu(cpu);
+	pin_cpu(core_ID);
 
 	//////////////////////////////////////////////////////////////////////
 	// Set up memory
@@ -73,6 +71,8 @@ int main(int argc, char **argv)
 	// Write data to the buffer so that any copy-on-write
 	// mechanisms will give us our own copies of the pages.
 	memset(buffer, 0, BUF_SIZE);
+
+	printf("Tx: starting setup\n");
 
 	// EV preparation variables
 	int l2_set_1 = 0;
@@ -238,7 +238,7 @@ int main(int argc, char **argv)
 			   get_cache_set_index((uint64_t)(current->address), 3),
 			   get_cache_slice_index(current->address));
 		#endif
-		_mm_lfence();
+		asm volatile ("isb");
 		maccess(current->address);
 		current = current->next;
 		i++;
@@ -254,17 +254,19 @@ int main(int argc, char **argv)
 			   get_cache_set_index((uint64_t)(current->address), 3),
 			   get_cache_slice_index(current->address));
 		#endif
-		_mm_lfence();
+		asm volatile ("isb");
 		maccess(current->address);
 		current = current->next;
 		i++;
 	}
 
-	_mm_lfence();
+	asm volatile ("isb");
 
 	//////////////////////////////////////////////////////////////////////
 	// Start CC
 	//////////////////////////////////////////////////////////////////////
+	
+	printf("Tx: Done with setup\n");
 
 	// Release setup mutex
 	sem_post(setup_sem);

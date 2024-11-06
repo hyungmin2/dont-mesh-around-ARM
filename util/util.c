@@ -1,9 +1,9 @@
 #include "util.h"
 #include "machine_const.h"
-#include "pmon_utils.h"
+// #include "pmon_utils.h"
 #include "skx_hash_utils.h"
 
-#define _GNU_SOURCE
+// #define _GNU_SOURCE
 
 #include <inttypes.h>
 #include <stdlib.h>
@@ -11,6 +11,7 @@
 #include <stdio.h>
 #include <sched.h>		// sched_setaffinity
 #include <stdbool.h>
+#include <pthread.h>
 
 /*
  * To be used to start a timing measurement.
@@ -23,14 +24,9 @@ uint64_t start_time(void)
 {
 	uint64_t t;
 	asm volatile(
-		"lfence\n\t"
-		"rdtsc\n\t"
-		"shl $32, %%rdx\n\t"
-		"or %%rdx, %0\n\t"
-		"lfence"
-		: "=a"(t) /*output*/
-		:
-		: "rdx", "memory", "cc");
+		"isb\n"
+		"mrs %0, cntvct_el0\n"
+		"isb" : "=r" (t));
 	return t;
 }
 
@@ -45,13 +41,9 @@ uint64_t stop_time(void)
 {
 	uint64_t t;
 	asm volatile(
-		"rdtscp\n\t"
-		"shl $32, %%rdx\n\t"
-		"or %%rdx, %0\n\t"
-		"lfence"
-		: "=a"(t) /*output*/
-		:
-		: "rcx", "rdx", "memory", "cc");
+		"isb\n"
+		"mrs %0, cntvct_el0\n"
+		"isb" : "=r" (t));
 	return t;
 }
 
@@ -138,19 +130,6 @@ uint64_t find_next_address_on_slice_and_set(void *va, uint8_t desired_slice, uin
 	return offset;
 }
 
-/**
- * Returns a Linux CPU ID located on the specified socket.
- */
-int get_cpu_on_socket(int socket) {
-    if (socket == 0) {
-        return 0;
-    } else if (socket == 1) {
-        return get_active_cpus() - 1; // cpu n-1 is on socket 1 on Unicorn
-    } else {
-        printf("ERROR: Cannot get cpu for socket %d. Socket must be 0 or 1\n", socket);
-        exit(-1);
-    }
-}
 
 /* 
  * Get the page frame number
@@ -212,1044 +191,1156 @@ uint64_t get_physical_address(void *address)
 	return physical_address;
 }
 
+
+struct job_info_timing {
+    void *va;
+    uint64_t repeat;
+    uint64_t elapsed;
+    int cpu_id;
+};
+
+struct job_info {
+    void *va;
+    int cpu_id;
+};
+
+volatile bool keep_running = true;
+pthread_mutex_t timing_mutex = PTHREAD_MUTEX_INITIALIZER;
+pthread_cond_t timing_cond = PTHREAD_COND_INITIALIZER;
+bool load_thread_started = false; // Flag to indicate that the thread has started
+
+void *probe_thread_timing(void *ptr) {
+    struct job_info_timing* ji = (struct job_info_timing *)ptr;
+    volatile uint64_t *p = (uint64_t *)ji->va;
+
+    cpu_set_t cpuset;
+    CPU_ZERO(&cpuset);
+    CPU_SET(ji->cpu_id, &cpuset);
+    sched_setaffinity(0, sizeof(cpu_set_t), &cpuset);
+
+    // Wait for the thread to start
+    pthread_mutex_lock(&timing_mutex);
+    while (load_thread_started == 0) {
+        pthread_cond_wait(&timing_cond, &timing_mutex); // Wait until thread sets the started flag
+    }
+    pthread_mutex_unlock(&timing_mutex);
+
+    uint64_t start;
+    asm volatile("mrs %0, cntvct_el0" : "=r" (start));  
+
+    uint64_t res;
+    for (int i = 0; i < ji->repeat; i ++) {
+        res = *p;
+    }
+
+    uint64_t end;
+    asm volatile("mrs %0, cntvct_el0" : "=r" (end));  
+
+    ji->elapsed = end - start;
+    return NULL;
+}
+
+void *load_thread_timing(void *ptr) {
+    struct job_info* ji = (struct job_info *)ptr;
+    volatile uint64_t *p = (uint64_t *)ji->va;
+
+    cpu_set_t cpuset;
+    CPU_ZERO(&cpuset);
+    CPU_SET(ji->cpu_id, &cpuset);
+    sched_setaffinity(0, sizeof(cpu_set_t), &cpuset);
+
+    pthread_mutex_lock(&timing_mutex);
+    load_thread_started = 1; // Set flag to indicate the thread has started
+    pthread_cond_signal(&timing_cond); // Signal the condition variable
+    pthread_mutex_unlock(&timing_mutex);
+
+    uint64_t res;
+    while (keep_running) {
+         *p = *p + 1;
+    }
+    return NULL;
+}
+
 /*
- * Calculate the slice for a virtual address
+ * Find the slice for a virtual address
  */
+uint64_t find_closest_slice(void *va)
+{
+    uint64_t shortest_time = 1000000000;
+    uint64_t shortest_cpu = -1;
+
+    for (int probe_cpu = 0; probe_cpu < NUM_CORES; probe_cpu+=2)  {
+        struct job_info_timing ji_p;
+        struct job_info ji_l;
+        ji_p.cpu_id = probe_cpu;
+        ji_l.cpu_id = probe_cpu+1;
+
+        ji_p.va = ji_l.va = va;
+
+        ji_p.repeat = 100000;
+
+        keep_running = true;
+        load_thread_started = false; 
+
+        pthread_t thread_p, thread_l;
+        pthread_create(&thread_p, NULL, probe_thread_timing, &ji_p);
+        pthread_create(&thread_l, NULL, load_thread_timing, &ji_l);
+        
+        pthread_join(thread_p, NULL);
+
+        keep_running = false;
+        pthread_join(thread_l, NULL);
+
+        printf("  cpu %d elapsed %ld\n",probe_cpu,ji_p.elapsed);
+        if (ji_p.elapsed < shortest_time) {
+            shortest_time = ji_p.elapsed;
+            shortest_cpu = probe_cpu;
+        }
+    }
+
+    return shortest_cpu;    
+}
+
 uint64_t get_cache_slice_index(void *va)
 {
-	// return (uint64_t)get_corresponding_cha(va); // old get_cha with pmon counters
-	return (uint64_t)get_cha_with_hash(va, false); // new get_cha with hash function
+	uint64_t t1 = find_closest_slice(va);
+	uint64_t t2 = find_closest_slice(va);
+
+	if(t1!= t2)
+		printf("mismatch! address %p core %ld - %ld\n",va,t1,t2); 
+	
+	return t1;
 }
 
 void flush_l1i(void)
 {
 	asm volatile(
 		R"(
-		.align 64
-		label1: jmp label2
-		.align 64
-		label2: jmp label3
-		.align 64
-		label3: jmp label4
-		.align 64
-		label4: jmp label5
-		.align 64
-		label5: jmp label6
-		.align 64
-		label6: jmp label7
-		.align 64
-		label7: jmp label8
-		.align 64
-		label8: jmp label9
-		.align 64
-		label9: jmp label10
-		.align 64
-		label10: jmp label11
-		.align 64
-		label11: jmp label12
-		.align 64
-		label12: jmp label13
-		.align 64
-		label13: jmp label14
-		.align 64
-		label14: jmp label15
-		.align 64
-		label15: jmp label16
-		.align 64
-		label16: jmp label17
-		.align 64
-		label17: jmp label18
-		.align 64
-		label18: jmp label19
-		.align 64
-		label19: jmp label20
-		.align 64
-		label20: jmp label21
-		.align 64
-		label21: jmp label22
-		.align 64
-		label22: jmp label23
-		.align 64
-		label23: jmp label24
-		.align 64
-		label24: jmp label25
-		.align 64
-		label25: jmp label26
-		.align 64
-		label26: jmp label27
-		.align 64
-		label27: jmp label28
-		.align 64
-		label28: jmp label29
-		.align 64
-		label29: jmp label30
-		.align 64
-		label30: jmp label31
-		.align 64
-		label31: jmp label32
-		.align 64
-		label32: jmp label33
-		.align 64
-		label33: jmp label34
-		.align 64
-		label34: jmp label35
-		.align 64
-		label35: jmp label36
-		.align 64
-		label36: jmp label37
-		.align 64
-		label37: jmp label38
-		.align 64
-		label38: jmp label39
-		.align 64
-		label39: jmp label40
-		.align 64
-		label40: jmp label41
-		.align 64
-		label41: jmp label42
-		.align 64
-		label42: jmp label43
-		.align 64
-		label43: jmp label44
-		.align 64
-		label44: jmp label45
-		.align 64
-		label45: jmp label46
-		.align 64
-		label46: jmp label47
-		.align 64
-		label47: jmp label48
-		.align 64
-		label48: jmp label49
-		.align 64
-		label49: jmp label50
-		.align 64
-		label50: jmp label51
-		.align 64
-		label51: jmp label52
-		.align 64
-		label52: jmp label53
-		.align 64
-		label53: jmp label54
-		.align 64
-		label54: jmp label55
-		.align 64
-		label55: jmp label56
-		.align 64
-		label56: jmp label57
-		.align 64
-		label57: jmp label58
-		.align 64
-		label58: jmp label59
-		.align 64
-		label59: jmp label60
-		.align 64
-		label60: jmp label61
-		.align 64
-		label61: jmp label62
-		.align 64
-		label62: jmp label63
-		.align 64
-		label63: jmp label64
-		.align 64
-		label64: jmp label65
-		.align 64
-		label65: jmp label66
-		.align 64
-		label66: jmp label67
-		.align 64
-		label67: jmp label68
-		.align 64
-		label68: jmp label69
-		.align 64
-		label69: jmp label70
-		.align 64
-		label70: jmp label71
-		.align 64
-		label71: jmp label72
-		.align 64
-		label72: jmp label73
-		.align 64
-		label73: jmp label74
-		.align 64
-		label74: jmp label75
-		.align 64
-		label75: jmp label76
-		.align 64
-		label76: jmp label77
-		.align 64
-		label77: jmp label78
-		.align 64
-		label78: jmp label79
-		.align 64
-		label79: jmp label80
-		.align 64
-		label80: jmp label81
-		.align 64
-		label81: jmp label82
-		.align 64
-		label82: jmp label83
-		.align 64
-		label83: jmp label84
-		.align 64
-		label84: jmp label85
-		.align 64
-		label85: jmp label86
-		.align 64
-		label86: jmp label87
-		.align 64
-		label87: jmp label88
-		.align 64
-		label88: jmp label89
-		.align 64
-		label89: jmp label90
-		.align 64
-		label90: jmp label91
-		.align 64
-		label91: jmp label92
-		.align 64
-		label92: jmp label93
-		.align 64
-		label93: jmp label94
-		.align 64
-		label94: jmp label95
-		.align 64
-		label95: jmp label96
-		.align 64
-		label96: jmp label97
-		.align 64
-		label97: jmp label98
-		.align 64
-		label98: jmp label99
-		.align 64
-		label99: jmp label100
-		.align 64
-		label100: jmp label101
-		.align 64
-		label101: jmp label102
-		.align 64
-		label102: jmp label103
-		.align 64
-		label103: jmp label104
-		.align 64
-		label104: jmp label105
-		.align 64
-		label105: jmp label106
-		.align 64
-		label106: jmp label107
-		.align 64
-		label107: jmp label108
-		.align 64
-		label108: jmp label109
-		.align 64
-		label109: jmp label110
-		.align 64
-		label110: jmp label111
-		.align 64
-		label111: jmp label112
-		.align 64
-		label112: jmp label113
-		.align 64
-		label113: jmp label114
-		.align 64
-		label114: jmp label115
-		.align 64
-		label115: jmp label116
-		.align 64
-		label116: jmp label117
-		.align 64
-		label117: jmp label118
-		.align 64
-		label118: jmp label119
-		.align 64
-		label119: jmp label120
-		.align 64
-		label120: jmp label121
-		.align 64
-		label121: jmp label122
-		.align 64
-		label122: jmp label123
-		.align 64
-		label123: jmp label124
-		.align 64
-		label124: jmp label125
-		.align 64
-		label125: jmp label126
-		.align 64
-		label126: jmp label127
-		.align 64
-		label127: jmp label128
-		.align 64
-		label128: jmp label129
-		.align 64
-		label129: jmp label130
-		.align 64
-		label130: jmp label131
-		.align 64
-		label131: jmp label132
-		.align 64
-		label132: jmp label133
-		.align 64
-		label133: jmp label134
-		.align 64
-		label134: jmp label135
-		.align 64
-		label135: jmp label136
-		.align 64
-		label136: jmp label137
-		.align 64
-		label137: jmp label138
-		.align 64
-		label138: jmp label139
-		.align 64
-		label139: jmp label140
-		.align 64
-		label140: jmp label141
-		.align 64
-		label141: jmp label142
-		.align 64
-		label142: jmp label143
-		.align 64
-		label143: jmp label144
-		.align 64
-		label144: jmp label145
-		.align 64
-		label145: jmp label146
-		.align 64
-		label146: jmp label147
-		.align 64
-		label147: jmp label148
-		.align 64
-		label148: jmp label149
-		.align 64
-		label149: jmp label150
-		.align 64
-		label150: jmp label151
-		.align 64
-		label151: jmp label152
-		.align 64
-		label152: jmp label153
-		.align 64
-		label153: jmp label154
-		.align 64
-		label154: jmp label155
-		.align 64
-		label155: jmp label156
-		.align 64
-		label156: jmp label157
-		.align 64
-		label157: jmp label158
-		.align 64
-		label158: jmp label159
-		.align 64
-		label159: jmp label160
-		.align 64
-		label160: jmp label161
-		.align 64
-		label161: jmp label162
-		.align 64
-		label162: jmp label163
-		.align 64
-		label163: jmp label164
-		.align 64
-		label164: jmp label165
-		.align 64
-		label165: jmp label166
-		.align 64
-		label166: jmp label167
-		.align 64
-		label167: jmp label168
-		.align 64
-		label168: jmp label169
-		.align 64
-		label169: jmp label170
-		.align 64
-		label170: jmp label171
-		.align 64
-		label171: jmp label172
-		.align 64
-		label172: jmp label173
-		.align 64
-		label173: jmp label174
-		.align 64
-		label174: jmp label175
-		.align 64
-		label175: jmp label176
-		.align 64
-		label176: jmp label177
-		.align 64
-		label177: jmp label178
-		.align 64
-		label178: jmp label179
-		.align 64
-		label179: jmp label180
-		.align 64
-		label180: jmp label181
-		.align 64
-		label181: jmp label182
-		.align 64
-		label182: jmp label183
-		.align 64
-		label183: jmp label184
-		.align 64
-		label184: jmp label185
-		.align 64
-		label185: jmp label186
-		.align 64
-		label186: jmp label187
-		.align 64
-		label187: jmp label188
-		.align 64
-		label188: jmp label189
-		.align 64
-		label189: jmp label190
-		.align 64
-		label190: jmp label191
-		.align 64
-		label191: jmp label192
-		.align 64
-		label192: jmp label193
-		.align 64
-		label193: jmp label194
-		.align 64
-		label194: jmp label195
-		.align 64
-		label195: jmp label196
-		.align 64
-		label196: jmp label197
-		.align 64
-		label197: jmp label198
-		.align 64
-		label198: jmp label199
-		.align 64
-		label199: jmp label200
-		.align 64
-		label200: jmp label201
-		.align 64
-		label201: jmp label202
-		.align 64
-		label202: jmp label203
-		.align 64
-		label203: jmp label204
-		.align 64
-		label204: jmp label205
-		.align 64
-		label205: jmp label206
-		.align 64
-		label206: jmp label207
-		.align 64
-		label207: jmp label208
-		.align 64
-		label208: jmp label209
-		.align 64
-		label209: jmp label210
-		.align 64
-		label210: jmp label211
-		.align 64
-		label211: jmp label212
-		.align 64
-		label212: jmp label213
-		.align 64
-		label213: jmp label214
-		.align 64
-		label214: jmp label215
-		.align 64
-		label215: jmp label216
-		.align 64
-		label216: jmp label217
-		.align 64
-		label217: jmp label218
-		.align 64
-		label218: jmp label219
-		.align 64
-		label219: jmp label220
-		.align 64
-		label220: jmp label221
-		.align 64
-		label221: jmp label222
-		.align 64
-		label222: jmp label223
-		.align 64
-		label223: jmp label224
-		.align 64
-		label224: jmp label225
-		.align 64
-		label225: jmp label226
-		.align 64
-		label226: jmp label227
-		.align 64
-		label227: jmp label228
-		.align 64
-		label228: jmp label229
-		.align 64
-		label229: jmp label230
-		.align 64
-		label230: jmp label231
-		.align 64
-		label231: jmp label232
-		.align 64
-		label232: jmp label233
-		.align 64
-		label233: jmp label234
-		.align 64
-		label234: jmp label235
-		.align 64
-		label235: jmp label236
-		.align 64
-		label236: jmp label237
-		.align 64
-		label237: jmp label238
-		.align 64
-		label238: jmp label239
-		.align 64
-		label239: jmp label240
-		.align 64
-		label240: jmp label241
-		.align 64
-		label241: jmp label242
-		.align 64
-		label242: jmp label243
-		.align 64
-		label243: jmp label244
-		.align 64
-		label244: jmp label245
-		.align 64
-		label245: jmp label246
-		.align 64
-		label246: jmp label247
-		.align 64
-		label247: jmp label248
-		.align 64
-		label248: jmp label249
-		.align 64
-		label249: jmp label250
-		.align 64
-		label250: jmp label251
-		.align 64
-		label251: jmp label252
-		.align 64
-		label252: jmp label253
-		.align 64
-		label253: jmp label254
-		.align 64
-		label254: jmp label255
-		.align 64
-		label255: jmp label256
-		.align 64
-		label256: jmp label257
-		.align 64
-		label257: jmp label258
-		.align 64
-		label258: jmp label259
-		.align 64
-		label259: jmp label260
-		.align 64
-		label260: jmp label261
-		.align 64
-		label261: jmp label262
-		.align 64
-		label262: jmp label263
-		.align 64
-		label263: jmp label264
-		.align 64
-		label264: jmp label265
-		.align 64
-		label265: jmp label266
-		.align 64
-		label266: jmp label267
-		.align 64
-		label267: jmp label268
-		.align 64
-		label268: jmp label269
-		.align 64
-		label269: jmp label270
-		.align 64
-		label270: jmp label271
-		.align 64
-		label271: jmp label272
-		.align 64
-		label272: jmp label273
-		.align 64
-		label273: jmp label274
-		.align 64
-		label274: jmp label275
-		.align 64
-		label275: jmp label276
-		.align 64
-		label276: jmp label277
-		.align 64
-		label277: jmp label278
-		.align 64
-		label278: jmp label279
-		.align 64
-		label279: jmp label280
-		.align 64
-		label280: jmp label281
-		.align 64
-		label281: jmp label282
-		.align 64
-		label282: jmp label283
-		.align 64
-		label283: jmp label284
-		.align 64
-		label284: jmp label285
-		.align 64
-		label285: jmp label286
-		.align 64
-		label286: jmp label287
-		.align 64
-		label287: jmp label288
-		.align 64
-		label288: jmp label289
-		.align 64
-		label289: jmp label290
-		.align 64
-		label290: jmp label291
-		.align 64
-		label291: jmp label292
-		.align 64
-		label292: jmp label293
-		.align 64
-		label293: jmp label294
-		.align 64
-		label294: jmp label295
-		.align 64
-		label295: jmp label296
-		.align 64
-		label296: jmp label297
-		.align 64
-		label297: jmp label298
-		.align 64
-		label298: jmp label299
-		.align 64
-		label299: jmp label300
-		.align 64
-		label300: jmp label301
-		.align 64
-		label301: jmp label302
-		.align 64
-		label302: jmp label303
-		.align 64
-		label303: jmp label304
-		.align 64
-		label304: jmp label305
-		.align 64
-		label305: jmp label306
-		.align 64
-		label306: jmp label307
-		.align 64
-		label307: jmp label308
-		.align 64
-		label308: jmp label309
-		.align 64
-		label309: jmp label310
-		.align 64
-		label310: jmp label311
-		.align 64
-		label311: jmp label312
-		.align 64
-		label312: jmp label313
-		.align 64
-		label313: jmp label314
-		.align 64
-		label314: jmp label315
-		.align 64
-		label315: jmp label316
-		.align 64
-		label316: jmp label317
-		.align 64
-		label317: jmp label318
-		.align 64
-		label318: jmp label319
-		.align 64
-		label319: jmp label320
-		.align 64
-		label320: jmp label321
-		.align 64
-		label321: jmp label322
-		.align 64
-		label322: jmp label323
-		.align 64
-		label323: jmp label324
-		.align 64
-		label324: jmp label325
-		.align 64
-		label325: jmp label326
-		.align 64
-		label326: jmp label327
-		.align 64
-		label327: jmp label328
-		.align 64
-		label328: jmp label329
-		.align 64
-		label329: jmp label330
-		.align 64
-		label330: jmp label331
-		.align 64
-		label331: jmp label332
-		.align 64
-		label332: jmp label333
-		.align 64
-		label333: jmp label334
-		.align 64
-		label334: jmp label335
-		.align 64
-		label335: jmp label336
-		.align 64
-		label336: jmp label337
-		.align 64
-		label337: jmp label338
-		.align 64
-		label338: jmp label339
-		.align 64
-		label339: jmp label340
-		.align 64
-		label340: jmp label341
-		.align 64
-		label341: jmp label342
-		.align 64
-		label342: jmp label343
-		.align 64
-		label343: jmp label344
-		.align 64
-		label344: jmp label345
-		.align 64
-		label345: jmp label346
-		.align 64
-		label346: jmp label347
-		.align 64
-		label347: jmp label348
-		.align 64
-		label348: jmp label349
-		.align 64
-		label349: jmp label350
-		.align 64
-		label350: jmp label351
-		.align 64
-		label351: jmp label352
-		.align 64
-		label352: jmp label353
-		.align 64
-		label353: jmp label354
-		.align 64
-		label354: jmp label355
-		.align 64
-		label355: jmp label356
-		.align 64
-		label356: jmp label357
-		.align 64
-		label357: jmp label358
-		.align 64
-		label358: jmp label359
-		.align 64
-		label359: jmp label360
-		.align 64
-		label360: jmp label361
-		.align 64
-		label361: jmp label362
-		.align 64
-		label362: jmp label363
-		.align 64
-		label363: jmp label364
-		.align 64
-		label364: jmp label365
-		.align 64
-		label365: jmp label366
-		.align 64
-		label366: jmp label367
-		.align 64
-		label367: jmp label368
-		.align 64
-		label368: jmp label369
-		.align 64
-		label369: jmp label370
-		.align 64
-		label370: jmp label371
-		.align 64
-		label371: jmp label372
-		.align 64
-		label372: jmp label373
-		.align 64
-		label373: jmp label374
-		.align 64
-		label374: jmp label375
-		.align 64
-		label375: jmp label376
-		.align 64
-		label376: jmp label377
-		.align 64
-		label377: jmp label378
-		.align 64
-		label378: jmp label379
-		.align 64
-		label379: jmp label380
-		.align 64
-		label380: jmp label381
-		.align 64
-		label381: jmp label382
-		.align 64
-		label382: jmp label383
-		.align 64
-		label383: jmp label384
-		.align 64
-		label384: jmp label385
-		.align 64
-		label385: jmp label386
-		.align 64
-		label386: jmp label387
-		.align 64
-		label387: jmp label388
-		.align 64
-		label388: jmp label389
-		.align 64
-		label389: jmp label390
-		.align 64
-		label390: jmp label391
-		.align 64
-		label391: jmp label392
-		.align 64
-		label392: jmp label393
-		.align 64
-		label393: jmp label394
-		.align 64
-		label394: jmp label395
-		.align 64
-		label395: jmp label396
-		.align 64
-		label396: jmp label397
-		.align 64
-		label397: jmp label398
-		.align 64
-		label398: jmp label399
-		.align 64
-		label399: jmp label400
-		.align 64
-		label400: jmp label401
-		.align 64
-		label401: jmp label402
-		.align 64
-		label402: jmp label403
-		.align 64
-		label403: jmp label404
-		.align 64
-		label404: jmp label405
-		.align 64
-		label405: jmp label406
-		.align 64
-		label406: jmp label407
-		.align 64
-		label407: jmp label408
-		.align 64
-		label408: jmp label409
-		.align 64
-		label409: jmp label410
-		.align 64
-		label410: jmp label411
-		.align 64
-		label411: jmp label412
-		.align 64
-		label412: jmp label413
-		.align 64
-		label413: jmp label414
-		.align 64
-		label414: jmp label415
-		.align 64
-		label415: jmp label416
-		.align 64
-		label416: jmp label417
-		.align 64
-		label417: jmp label418
-		.align 64
-		label418: jmp label419
-		.align 64
-		label419: jmp label420
-		.align 64
-		label420: jmp label421
-		.align 64
-		label421: jmp label422
-		.align 64
-		label422: jmp label423
-		.align 64
-		label423: jmp label424
-		.align 64
-		label424: jmp label425
-		.align 64
-		label425: jmp label426
-		.align 64
-		label426: jmp label427
-		.align 64
-		label427: jmp label428
-		.align 64
-		label428: jmp label429
-		.align 64
-		label429: jmp label430
-		.align 64
-		label430: jmp label431
-		.align 64
-		label431: jmp label432
-		.align 64
-		label432: jmp label433
-		.align 64
-		label433: jmp label434
-		.align 64
-		label434: jmp label435
-		.align 64
-		label435: jmp label436
-		.align 64
-		label436: jmp label437
-		.align 64
-		label437: jmp label438
-		.align 64
-		label438: jmp label439
-		.align 64
-		label439: jmp label440
-		.align 64
-		label440: jmp label441
-		.align 64
-		label441: jmp label442
-		.align 64
-		label442: jmp label443
-		.align 64
-		label443: jmp label444
-		.align 64
-		label444: jmp label445
-		.align 64
-		label445: jmp label446
-		.align 64
-		label446: jmp label447
-		.align 64
-		label447: jmp label448
-		.align 64
-		label448: jmp label449
-		.align 64
-		label449: jmp label450
-		.align 64
-		label450: jmp label451
-		.align 64
-		label451: jmp label452
-		.align 64
-		label452: jmp label453
-		.align 64
-		label453: jmp label454
-		.align 64
-		label454: jmp label455
-		.align 64
-		label455: jmp label456
-		.align 64
-		label456: jmp label457
-		.align 64
-		label457: jmp label458
-		.align 64
-		label458: jmp label459
-		.align 64
-		label459: jmp label460
-		.align 64
-		label460: jmp label461
-		.align 64
-		label461: jmp label462
-		.align 64
-		label462: jmp label463
-		.align 64
-		label463: jmp label464
-		.align 64
-		label464: jmp label465
-		.align 64
-		label465: jmp label466
-		.align 64
-		label466: jmp label467
-		.align 64
-		label467: jmp label468
-		.align 64
-		label468: jmp label469
-		.align 64
-		label469: jmp label470
-		.align 64
-		label470: jmp label471
-		.align 64
-		label471: jmp label472
-		.align 64
-		label472: jmp label473
-		.align 64
-		label473: jmp label474
-		.align 64
-		label474: jmp label475
-		.align 64
-		label475: jmp label476
-		.align 64
-		label476: jmp label477
-		.align 64
-		label477: jmp label478
-		.align 64
-		label478: jmp label479
-		.align 64
-		label479: jmp label480
-		.align 64
-		label480: jmp label481
-		.align 64
-		label481: jmp label482
-		.align 64
-		label482: jmp label483
-		.align 64
-		label483: jmp label484
-		.align 64
-		label484: jmp label485
-		.align 64
-		label485: jmp label486
-		.align 64
-		label486: jmp label487
-		.align 64
-		label487: jmp label488
-		.align 64
-		label488: jmp label489
-		.align 64
-		label489: jmp label490
-		.align 64
-		label490: jmp label491
-		.align 64
-		label491: jmp label492
-		.align 64
-		label492: jmp label493
-		.align 64
-		label493: jmp label494
-		.align 64
-		label494: jmp label495
-		.align 64
-		label495: jmp label496
-		.align 64
-		label496: jmp label497
-		.align 64
-		label497: jmp label498
-		.align 64
-		label498: jmp label499
-		.align 64
-		label499: jmp label500
-		.align 64
-		label500: jmp label501
-		.align 64
-		label501: jmp label502
-		.align 64
-		label502: jmp label503
-		.align 64
-		label503: jmp label504
-		.align 64
-		label504: jmp label505
-		.align 64
-		label505: jmp label506
-		.align 64
-		label506: jmp label507
-		.align 64
-		label507: jmp label508
-		.align 64
-		label508: jmp label509
-		.align 64
-		label509: jmp label510
-		.align 64
-		label510: jmp label511
-		.align 64
-		label511: jmp label512
-		.align 64
-		label512: xor %%eax, %%eax)"
+		.balign 64
+		label1: b label2
+		.balign 64
+		label2: b label3
+		.balign 64
+		label3: b label4
+		.balign 64
+		label4: b label5
+		.balign 64
+		label5: b label6
+		.balign 64
+		label6: b label7
+		.balign 64
+		label7: b label8
+		.balign 64
+		label8: b label9
+		.balign 64
+		label9: b label10
+		.balign 64
+		label10: b label11
+		.balign 64
+		label11: b label12
+		.balign 64
+		label12: b label13
+		.balign 64
+		label13: b label14
+		.balign 64
+		label14: b label15
+		.balign 64
+		label15: b label16
+		.balign 64
+		label16: b label17
+		.balign 64
+		label17: b label18
+		.balign 64
+		label18: b label19
+		.balign 64
+		label19: b label20
+		.balign 64
+		label20: b label21
+		.balign 64
+		label21: b label22
+		.balign 64
+		label22: b label23
+		.balign 64
+		label23: b label24
+		.balign 64
+		label24: b label25
+		.balign 64
+		label25: b label26
+		.balign 64
+		label26: b label27
+		.balign 64
+		label27: b label28
+		.balign 64
+		label28: b label29
+		.balign 64
+		label29: b label30
+		.balign 64
+		label30: b label31
+		.balign 64
+		label31: b label32
+		.balign 64
+		label32: b label33
+		.balign 64
+		label33: b label34
+		.balign 64
+		label34: b label35
+		.balign 64
+		label35: b label36
+		.balign 64
+		label36: b label37
+		.balign 64
+		label37: b label38
+		.balign 64
+		label38: b label39
+		.balign 64
+		label39: b label40
+		.balign 64
+		label40: b label41
+		.balign 64
+		label41: b label42
+		.balign 64
+		label42: b label43
+		.balign 64
+		label43: b label44
+		.balign 64
+		label44: b label45
+		.balign 64
+		label45: b label46
+		.balign 64
+		label46: b label47
+		.balign 64
+		label47: b label48
+		.balign 64
+		label48: b label49
+		.balign 64
+		label49: b label50
+		.balign 64
+		label50: b label51
+		.balign 64
+		label51: b label52
+		.balign 64
+		label52: b label53
+		.balign 64
+		label53: b label54
+		.balign 64
+		label54: b label55
+		.balign 64
+		label55: b label56
+		.balign 64
+		label56: b label57
+		.balign 64
+		label57: b label58
+		.balign 64
+		label58: b label59
+		.balign 64
+		label59: b label60
+		.balign 64
+		label60: b label61
+		.balign 64
+		label61: b label62
+		.balign 64
+		label62: b label63
+		.balign 64
+		label63: b label64
+		.balign 64
+		label64: b label65
+		.balign 64
+		label65: b label66
+		.balign 64
+		label66: b label67
+		.balign 64
+		label67: b label68
+		.balign 64
+		label68: b label69
+		.balign 64
+		label69: b label70
+		.balign 64
+		label70: b label71
+		.balign 64
+		label71: b label72
+		.balign 64
+		label72: b label73
+		.balign 64
+		label73: b label74
+		.balign 64
+		label74: b label75
+		.balign 64
+		label75: b label76
+		.balign 64
+		label76: b label77
+		.balign 64
+		label77: b label78
+		.balign 64
+		label78: b label79
+		.balign 64
+		label79: b label80
+		.balign 64
+		label80: b label81
+		.balign 64
+		label81: b label82
+		.balign 64
+		label82: b label83
+		.balign 64
+		label83: b label84
+		.balign 64
+		label84: b label85
+		.balign 64
+		label85: b label86
+		.balign 64
+		label86: b label87
+		.balign 64
+		label87: b label88
+		.balign 64
+		label88: b label89
+		.balign 64
+		label89: b label90
+		.balign 64
+		label90: b label91
+		.balign 64
+		label91: b label92
+		.balign 64
+		label92: b label93
+		.balign 64
+		label93: b label94
+		.balign 64
+		label94: b label95
+		.balign 64
+		label95: b label96
+		.balign 64
+		label96: b label97
+		.balign 64
+		label97: b label98
+		.balign 64
+		label98: b label99
+		.balign 64
+		label99: b label100
+		.balign 64
+		label100: b label101
+		.balign 64
+		label101: b label102
+		.balign 64
+		label102: b label103
+		.balign 64
+		label103: b label104
+		.balign 64
+		label104: b label105
+		.balign 64
+		label105: b label106
+		.balign 64
+		label106: b label107
+		.balign 64
+		label107: b label108
+		.balign 64
+		label108: b label109
+		.balign 64
+		label109: b label110
+		.balign 64
+		label110: b label111
+		.balign 64
+		label111: b label112
+		.balign 64
+		label112: b label113
+		.balign 64
+		label113: b label114
+		.balign 64
+		label114: b label115
+		.balign 64
+		label115: b label116
+		.balign 64
+		label116: b label117
+		.balign 64
+		label117: b label118
+		.balign 64
+		label118: b label119
+		.balign 64
+		label119: b label120
+		.balign 64
+		label120: b label121
+		.balign 64
+		label121: b label122
+		.balign 64
+		label122: b label123
+		.balign 64
+		label123: b label124
+		.balign 64
+		label124: b label125
+		.balign 64
+		label125: b label126
+		.balign 64
+		label126: b label127
+		.balign 64
+		label127: b label128
+		.balign 64
+		label128: b label129
+		.balign 64
+		label129: b label130
+		.balign 64
+		label130: b label131
+		.balign 64
+		label131: b label132
+		.balign 64
+		label132: b label133
+		.balign 64
+		label133: b label134
+		.balign 64
+		label134: b label135
+		.balign 64
+		label135: b label136
+		.balign 64
+		label136: b label137
+		.balign 64
+		label137: b label138
+		.balign 64
+		label138: b label139
+		.balign 64
+		label139: b label140
+		.balign 64
+		label140: b label141
+		.balign 64
+		label141: b label142
+		.balign 64
+		label142: b label143
+		.balign 64
+		label143: b label144
+		.balign 64
+		label144: b label145
+		.balign 64
+		label145: b label146
+		.balign 64
+		label146: b label147
+		.balign 64
+		label147: b label148
+		.balign 64
+		label148: b label149
+		.balign 64
+		label149: b label150
+		.balign 64
+		label150: b label151
+		.balign 64
+		label151: b label152
+		.balign 64
+		label152: b label153
+		.balign 64
+		label153: b label154
+		.balign 64
+		label154: b label155
+		.balign 64
+		label155: b label156
+		.balign 64
+		label156: b label157
+		.balign 64
+		label157: b label158
+		.balign 64
+		label158: b label159
+		.balign 64
+		label159: b label160
+		.balign 64
+		label160: b label161
+		.balign 64
+		label161: b label162
+		.balign 64
+		label162: b label163
+		.balign 64
+		label163: b label164
+		.balign 64
+		label164: b label165
+		.balign 64
+		label165: b label166
+		.balign 64
+		label166: b label167
+		.balign 64
+		label167: b label168
+		.balign 64
+		label168: b label169
+		.balign 64
+		label169: b label170
+		.balign 64
+		label170: b label171
+		.balign 64
+		label171: b label172
+		.balign 64
+		label172: b label173
+		.balign 64
+		label173: b label174
+		.balign 64
+		label174: b label175
+		.balign 64
+		label175: b label176
+		.balign 64
+		label176: b label177
+		.balign 64
+		label177: b label178
+		.balign 64
+		label178: b label179
+		.balign 64
+		label179: b label180
+		.balign 64
+		label180: b label181
+		.balign 64
+		label181: b label182
+		.balign 64
+		label182: b label183
+		.balign 64
+		label183: b label184
+		.balign 64
+		label184: b label185
+		.balign 64
+		label185: b label186
+		.balign 64
+		label186: b label187
+		.balign 64
+		label187: b label188
+		.balign 64
+		label188: b label189
+		.balign 64
+		label189: b label190
+		.balign 64
+		label190: b label191
+		.balign 64
+		label191: b label192
+		.balign 64
+		label192: b label193
+		.balign 64
+		label193: b label194
+		.balign 64
+		label194: b label195
+		.balign 64
+		label195: b label196
+		.balign 64
+		label196: b label197
+		.balign 64
+		label197: b label198
+		.balign 64
+		label198: b label199
+		.balign 64
+		label199: b label200
+		.balign 64
+		label200: b label201
+		.balign 64
+		label201: b label202
+		.balign 64
+		label202: b label203
+		.balign 64
+		label203: b label204
+		.balign 64
+		label204: b label205
+		.balign 64
+		label205: b label206
+		.balign 64
+		label206: b label207
+		.balign 64
+		label207: b label208
+		.balign 64
+		label208: b label209
+		.balign 64
+		label209: b label210
+		.balign 64
+		label210: b label211
+		.balign 64
+		label211: b label212
+		.balign 64
+		label212: b label213
+		.balign 64
+		label213: b label214
+		.balign 64
+		label214: b label215
+		.balign 64
+		label215: b label216
+		.balign 64
+		label216: b label217
+		.balign 64
+		label217: b label218
+		.balign 64
+		label218: b label219
+		.balign 64
+		label219: b label220
+		.balign 64
+		label220: b label221
+		.balign 64
+		label221: b label222
+		.balign 64
+		label222: b label223
+		.balign 64
+		label223: b label224
+		.balign 64
+		label224: b label225
+		.balign 64
+		label225: b label226
+		.balign 64
+		label226: b label227
+		.balign 64
+		label227: b label228
+		.balign 64
+		label228: b label229
+		.balign 64
+		label229: b label230
+		.balign 64
+		label230: b label231
+		.balign 64
+		label231: b label232
+		.balign 64
+		label232: b label233
+		.balign 64
+		label233: b label234
+		.balign 64
+		label234: b label235
+		.balign 64
+		label235: b label236
+		.balign 64
+		label236: b label237
+		.balign 64
+		label237: b label238
+		.balign 64
+		label238: b label239
+		.balign 64
+		label239: b label240
+		.balign 64
+		label240: b label241
+		.balign 64
+		label241: b label242
+		.balign 64
+		label242: b label243
+		.balign 64
+		label243: b label244
+		.balign 64
+		label244: b label245
+		.balign 64
+		label245: b label246
+		.balign 64
+		label246: b label247
+		.balign 64
+		label247: b label248
+		.balign 64
+		label248: b label249
+		.balign 64
+		label249: b label250
+		.balign 64
+		label250: b label251
+		.balign 64
+		label251: b label252
+		.balign 64
+		label252: b label253
+		.balign 64
+		label253: b label254
+		.balign 64
+		label254: b label255
+		.balign 64
+		label255: b label256
+		.balign 64
+		label256: b label257
+		.balign 64
+		label257: b label258
+		.balign 64
+		label258: b label259
+		.balign 64
+		label259: b label260
+		.balign 64
+		label260: b label261
+		.balign 64
+		label261: b label262
+		.balign 64
+		label262: b label263
+		.balign 64
+		label263: b label264
+		.balign 64
+		label264: b label265
+		.balign 64
+		label265: b label266
+		.balign 64
+		label266: b label267
+		.balign 64
+		label267: b label268
+		.balign 64
+		label268: b label269
+		.balign 64
+		label269: b label270
+		.balign 64
+		label270: b label271
+		.balign 64
+		label271: b label272
+		.balign 64
+		label272: b label273
+		.balign 64
+		label273: b label274
+		.balign 64
+		label274: b label275
+		.balign 64
+		label275: b label276
+		.balign 64
+		label276: b label277
+		.balign 64
+		label277: b label278
+		.balign 64
+		label278: b label279
+		.balign 64
+		label279: b label280
+		.balign 64
+		label280: b label281
+		.balign 64
+		label281: b label282
+		.balign 64
+		label282: b label283
+		.balign 64
+		label283: b label284
+		.balign 64
+		label284: b label285
+		.balign 64
+		label285: b label286
+		.balign 64
+		label286: b label287
+		.balign 64
+		label287: b label288
+		.balign 64
+		label288: b label289
+		.balign 64
+		label289: b label290
+		.balign 64
+		label290: b label291
+		.balign 64
+		label291: b label292
+		.balign 64
+		label292: b label293
+		.balign 64
+		label293: b label294
+		.balign 64
+		label294: b label295
+		.balign 64
+		label295: b label296
+		.balign 64
+		label296: b label297
+		.balign 64
+		label297: b label298
+		.balign 64
+		label298: b label299
+		.balign 64
+		label299: b label300
+		.balign 64
+		label300: b label301
+		.balign 64
+		label301: b label302
+		.balign 64
+		label302: b label303
+		.balign 64
+		label303: b label304
+		.balign 64
+		label304: b label305
+		.balign 64
+		label305: b label306
+		.balign 64
+		label306: b label307
+		.balign 64
+		label307: b label308
+		.balign 64
+		label308: b label309
+		.balign 64
+		label309: b label310
+		.balign 64
+		label310: b label311
+		.balign 64
+		label311: b label312
+		.balign 64
+		label312: b label313
+		.balign 64
+		label313: b label314
+		.balign 64
+		label314: b label315
+		.balign 64
+		label315: b label316
+		.balign 64
+		label316: b label317
+		.balign 64
+		label317: b label318
+		.balign 64
+		label318: b label319
+		.balign 64
+		label319: b label320
+		.balign 64
+		label320: b label321
+		.balign 64
+		label321: b label322
+		.balign 64
+		label322: b label323
+		.balign 64
+		label323: b label324
+		.balign 64
+		label324: b label325
+		.balign 64
+		label325: b label326
+		.balign 64
+		label326: b label327
+		.balign 64
+		label327: b label328
+		.balign 64
+		label328: b label329
+		.balign 64
+		label329: b label330
+		.balign 64
+		label330: b label331
+		.balign 64
+		label331: b label332
+		.balign 64
+		label332: b label333
+		.balign 64
+		label333: b label334
+		.balign 64
+		label334: b label335
+		.balign 64
+		label335: b label336
+		.balign 64
+		label336: b label337
+		.balign 64
+		label337: b label338
+		.balign 64
+		label338: b label339
+		.balign 64
+		label339: b label340
+		.balign 64
+		label340: b label341
+		.balign 64
+		label341: b label342
+		.balign 64
+		label342: b label343
+		.balign 64
+		label343: b label344
+		.balign 64
+		label344: b label345
+		.balign 64
+		label345: b label346
+		.balign 64
+		label346: b label347
+		.balign 64
+		label347: b label348
+		.balign 64
+		label348: b label349
+		.balign 64
+		label349: b label350
+		.balign 64
+		label350: b label351
+		.balign 64
+		label351: b label352
+		.balign 64
+		label352: b label353
+		.balign 64
+		label353: b label354
+		.balign 64
+		label354: b label355
+		.balign 64
+		label355: b label356
+		.balign 64
+		label356: b label357
+		.balign 64
+		label357: b label358
+		.balign 64
+		label358: b label359
+		.balign 64
+		label359: b label360
+		.balign 64
+		label360: b label361
+		.balign 64
+		label361: b label362
+		.balign 64
+		label362: b label363
+		.balign 64
+		label363: b label364
+		.balign 64
+		label364: b label365
+		.balign 64
+		label365: b label366
+		.balign 64
+		label366: b label367
+		.balign 64
+		label367: b label368
+		.balign 64
+		label368: b label369
+		.balign 64
+		label369: b label370
+		.balign 64
+		label370: b label371
+		.balign 64
+		label371: b label372
+		.balign 64
+		label372: b label373
+		.balign 64
+		label373: b label374
+		.balign 64
+		label374: b label375
+		.balign 64
+		label375: b label376
+		.balign 64
+		label376: b label377
+		.balign 64
+		label377: b label378
+		.balign 64
+		label378: b label379
+		.balign 64
+		label379: b label380
+		.balign 64
+		label380: b label381
+		.balign 64
+		label381: b label382
+		.balign 64
+		label382: b label383
+		.balign 64
+		label383: b label384
+		.balign 64
+		label384: b label385
+		.balign 64
+		label385: b label386
+		.balign 64
+		label386: b label387
+		.balign 64
+		label387: b label388
+		.balign 64
+		label388: b label389
+		.balign 64
+		label389: b label390
+		.balign 64
+		label390: b label391
+		.balign 64
+		label391: b label392
+		.balign 64
+		label392: b label393
+		.balign 64
+		label393: b label394
+		.balign 64
+		label394: b label395
+		.balign 64
+		label395: b label396
+		.balign 64
+		label396: b label397
+		.balign 64
+		label397: b label398
+		.balign 64
+		label398: b label399
+		.balign 64
+		label399: b label400
+		.balign 64
+		label400: b label401
+		.balign 64
+		label401: b label402
+		.balign 64
+		label402: b label403
+		.balign 64
+		label403: b label404
+		.balign 64
+		label404: b label405
+		.balign 64
+		label405: b label406
+		.balign 64
+		label406: b label407
+		.balign 64
+		label407: b label408
+		.balign 64
+		label408: b label409
+		.balign 64
+		label409: b label410
+		.balign 64
+		label410: b label411
+		.balign 64
+		label411: b label412
+		.balign 64
+		label412: b label413
+		.balign 64
+		label413: b label414
+		.balign 64
+		label414: b label415
+		.balign 64
+		label415: b label416
+		.balign 64
+		label416: b label417
+		.balign 64
+		label417: b label418
+		.balign 64
+		label418: b label419
+		.balign 64
+		label419: b label420
+		.balign 64
+		label420: b label421
+		.balign 64
+		label421: b label422
+		.balign 64
+		label422: b label423
+		.balign 64
+		label423: b label424
+		.balign 64
+		label424: b label425
+		.balign 64
+		label425: b label426
+		.balign 64
+		label426: b label427
+		.balign 64
+		label427: b label428
+		.balign 64
+		label428: b label429
+		.balign 64
+		label429: b label430
+		.balign 64
+		label430: b label431
+		.balign 64
+		label431: b label432
+		.balign 64
+		label432: b label433
+		.balign 64
+		label433: b label434
+		.balign 64
+		label434: b label435
+		.balign 64
+		label435: b label436
+		.balign 64
+		label436: b label437
+		.balign 64
+		label437: b label438
+		.balign 64
+		label438: b label439
+		.balign 64
+		label439: b label440
+		.balign 64
+		label440: b label441
+		.balign 64
+		label441: b label442
+		.balign 64
+		label442: b label443
+		.balign 64
+		label443: b label444
+		.balign 64
+		label444: b label445
+		.balign 64
+		label445: b label446
+		.balign 64
+		label446: b label447
+		.balign 64
+		label447: b label448
+		.balign 64
+		label448: b label449
+		.balign 64
+		label449: b label450
+		.balign 64
+		label450: b label451
+		.balign 64
+		label451: b label452
+		.balign 64
+		label452: b label453
+		.balign 64
+		label453: b label454
+		.balign 64
+		label454: b label455
+		.balign 64
+		label455: b label456
+		.balign 64
+		label456: b label457
+		.balign 64
+		label457: b label458
+		.balign 64
+		label458: b label459
+		.balign 64
+		label459: b label460
+		.balign 64
+		label460: b label461
+		.balign 64
+		label461: b label462
+		.balign 64
+		label462: b label463
+		.balign 64
+		label463: b label464
+		.balign 64
+		label464: b label465
+		.balign 64
+		label465: b label466
+		.balign 64
+		label466: b label467
+		.balign 64
+		label467: b label468
+		.balign 64
+		label468: b label469
+		.balign 64
+		label469: b label470
+		.balign 64
+		label470: b label471
+		.balign 64
+		label471: b label472
+		.balign 64
+		label472: b label473
+		.balign 64
+		label473: b label474
+		.balign 64
+		label474: b label475
+		.balign 64
+		label475: b label476
+		.balign 64
+		label476: b label477
+		.balign 64
+		label477: b label478
+		.balign 64
+		label478: b label479
+		.balign 64
+		label479: b label480
+		.balign 64
+		label480: b label481
+		.balign 64
+		label481: b label482
+		.balign 64
+		label482: b label483
+		.balign 64
+		label483: b label484
+		.balign 64
+		label484: b label485
+		.balign 64
+		label485: b label486
+		.balign 64
+		label486: b label487
+		.balign 64
+		label487: b label488
+		.balign 64
+		label488: b label489
+		.balign 64
+		label489: b label490
+		.balign 64
+		label490: b label491
+		.balign 64
+		label491: b label492
+		.balign 64
+		label492: b label493
+		.balign 64
+		label493: b label494
+		.balign 64
+		label494: b label495
+		.balign 64
+		label495: b label496
+		.balign 64
+		label496: b label497
+		.balign 64
+		label497: b label498
+		.balign 64
+		label498: b label499
+		.balign 64
+		label499: b label500
+		.balign 64
+		label500: b label501
+		.balign 64
+		label501: b label502
+		.balign 64
+		label502: b label503
+		.balign 64
+		label503: b label504
+		.balign 64
+		label504: b label505
+		.balign 64
+		label505: b label506
+		.balign 64
+		label506: b label507
+		.balign 64
+		label507: b label508
+		.balign 64
+		label508: b label509
+		.balign 64
+		label509: b label510
+		.balign 64
+		label510: b label511
+		.balign 64
+		label511: b label512
+		.balign 64
+		label512: mov x0, xzr)"
 		:
 		:
-		: "eax", "memory");
+		: "x0", "memory");
 }

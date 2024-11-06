@@ -1,7 +1,7 @@
 #ifndef _UTIL_H
 #define _UTIL_H
 
-#define _GNU_SOURCE
+// #define _GNU_SOURCE
 
 #include <inttypes.h>
 #include <stdlib.h>
@@ -17,15 +17,12 @@ uint64_t find_next_address_on_slice_and_set(void *va, uint8_t desired_slice, uin
  */
 inline uint64_t get_time(void)
 {
-	uint64_t cycles;
-	asm volatile("rdtscp\n\t"
-				 "shl $32, %%rdx\n\t"
-				 "or %%rdx, %0\n\t"
-				 : "=a"(cycles)
-				 :
-				 : "rcx", "rdx", "memory");
-
-	return cycles;
+	uint64_t t;
+	asm volatile(
+		"isb\n"
+		"mrs %0, cntvct_el0\n"
+		"isb" : "=r" (t));
+	return t;
 }
 
 uint64_t start_time(void);
@@ -43,8 +40,7 @@ inline void wait_cycles(uint64_t delay)
 
 inline void maccess(void *p)
 {
-	asm volatile("movq (%0), %%rax" ::"r"(p)
-				 : "rax");
+	asm volatile("ldr x0, [%0]" : : "r"(p) : "x0");
 }
 
 struct Node {
@@ -54,7 +50,6 @@ struct Node {
 
 void append_string_to_linked_list(struct Node **head, void *addr);
 
-int get_cpu_on_socket(int socket); 
 uint64_t get_physical_address(void *address);
 uint64_t get_cache_slice_index(void *va);
 

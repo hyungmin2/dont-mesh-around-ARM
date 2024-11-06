@@ -36,24 +36,24 @@
 
 // 32 KiB, 8-way, 64 B/line
 // 64 sets (6 index bits)
-#define L1_CACHE_WAYS 8
-#define L1_CACHE_SETS 64
-#define L1_CACHE_SETS_LOG 6
+#define L1_CACHE_WAYS 4
+#define L1_CACHE_SETS 256
+#define L1_CACHE_SETS_LOG 8
 #define L1_CACHE_SIZE (L1_CACHE_SETS) * (L1_CACHE_WAYS) * (CACHE_BLOCK_SIZE)
 
 // 1 MiB, 16-way, 64 B/line, inclusive
 // 1024 sets (10 index bits)
-#define L2_CACHE_WAYS 16
-#define L2_CACHE_SETS 1024
-#define L2_CACHE_SETS_LOG 10
+#define L2_CACHE_WAYS 8
+#define L2_CACHE_SETS 2048
+#define L2_CACHE_SETS_LOG 11
 #define L2_CACHE_SIZE (L2_CACHE_SETS) * (L2_CACHE_WAYS) * (CACHE_BLOCK_SIZE)
 
 // 1.375 MiB, 11-way, 64 B/line, non-inclusive
 // 2048 sets (11 index bits)
-#define LLC_CACHE_WAYS 11
-#define LLC_CACHE_SETS_PER_SLICE 2048
-#define LLC_CACHE_SETS_LOG 11
-#define LLC_CACHE_SLICES 26
+#define LLC_CACHE_WAYS 16
+#define LLC_CACHE_SETS_PER_SLICE 1024
+#define LLC_CACHE_SETS_LOG 10
+#define LLC_CACHE_SLICES 32
 #define LLC_CACHE_SIZE (LLC_CACHE_SETS_TOTAL) * (LLC_CACHE_WAYS) * (CACHE_BLOCK_SIZE)
 
 /* 
@@ -61,32 +61,12 @@
  */
 
 #define L1_SET_INDEX_MASK 0xFC0				 /* 6 bits - [11-6] - 64 sets */
-#define L2_SET_INDEX_MASK 0xFFC0			 /* 10 bits - [15-6] - 1024 sets */
-#define LLC_SET_INDEX_PER_SLICE_MASK 0x1FFC0 /* 11 bits - [16-6] - 2048 sets */
-#define LLC_INDEX_STRIDE 0x20000			 /* Offset required to get the next address with the same LLC cache set index. 17 = bit 16 (MSB bit of LLC_SET_INDEX_PER_SLICE_MASK) + 1 */
-#define L2_INDEX_STRIDE 0x10000				 /* Offset required to get the next address with the same L2 cache set index. 16 = bit 15 (MSB bit of L2_SET_INDEX_MASK) + 1 */
+#define L2_SET_INDEX_MASK 0x1FFC0			 /* 11 bits - [16-6] - 2048 sets */
+#define LLC_SET_INDEX_PER_SLICE_MASK 0xFFC0  /* 10 bits - [15-6] - 1024 sets */
+#define LLC_INDEX_STRIDE 0x10000			 /* Offset required to get the next address with the same LLC cache set index. 16 = bit 15 (MSB bit of LLC_SET_INDEX_PER_SLICE_MASK) + 1 */
+#define L2_INDEX_STRIDE 0x20000				 /* Offset required to get the next address with the same L2 cache set index. 17 = bit 16 (MSB bit of L2_SET_INDEX_MASK) + 1 */
 
-/*
- * CPU Topology details
- * 
- * By default, the values are for hyperthreading off.
- */
-
-// Uncomment the following line if hyperthreading is turned on
-// #define HYPERTHREADING_ON
-
-#define NUM_SOCKET                  2
-#define NUM_CORES_PER_SOCKET        24
-#define NUM_CHA                     LLC_CACHE_SLICES
-
-#ifdef HYPERTHREADING_ON
-#define NUM_LOG_CORES_PER_SOCKET    48
-#else
-#define NUM_LOG_CORES_PER_SOCKET    24
-#endif
-
-extern const int cha_id_to_cpu[];
-extern const int cpu_on_socket[];
+#define NUM_CORES 64
 
 /*
  * Memory related constants

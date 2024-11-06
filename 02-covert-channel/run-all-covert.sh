@@ -21,9 +21,9 @@ sudo killall transmitter &> /dev/null
 
 # Run
 until
-	sudo ./bin/transmitter 8 5 $INTERVAL & # > /dev/null &
+	sudo ./bin/transmitter 0 16 $INTERVAL & # > /dev/null &
 	sleep 1
-	sudo ./bin/receiver-no-ev 7 6 ./out/receiver-contention.out $INTERVAL #> /dev/null
+	sudo ./bin/receiver-no-ev 2 18 ./out/receiver-contention.out $INTERVAL #> /dev/null
 do
 	echo "Repeating iteration $i because it failed"
 	sudo killall transmitter &> /dev/null
