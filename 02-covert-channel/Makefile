@@ -1,6 +1,6 @@
-CC:= gcc
+CC:= g++
 # HOSTNAME := $(shell hostname|awk '{print toupper($$0)'})
-CFLAGS:= -O3 -D_POSIX_SOURCE -D_GNU_SOURCE #-D$(HOSTNAME)
+CFLAGS:= -std=c++20 -O3 -D_POSIX_SOURCE -D_GNU_SOURCE #-D$(HOSTNAME)
 CFLAGSO1:= -O1 -D_POSIX_SOURCE -D_GNU_SOURCE #-D$(HOSTNAME)
 LIBS:= -lpthread -lrt
 
@@ -21,10 +21,10 @@ setup-sem: obj/setup-sem.o
 cleanup-sem: obj/cleanup-sem.o
 	$(CC) -o bin/$@ $^ $(LIBS)
 
-obj/transmitter-rand-bits.o: transmitter.c
+obj/transmitter-rand-bits.o: transmitter.cpp
 	$(CC) -c $(CFLAGS) -DRANDOM_PATTERN -o $@ $<
 
-obj/%.o: %.c
+obj/%.o: %.cpp
 	$(CC) -c $(CFLAGS) -o $@ $<
 
 obj:

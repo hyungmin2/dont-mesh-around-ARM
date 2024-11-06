@@ -55,7 +55,7 @@ void append_string_to_linked_list(struct Node **head, void *addr)
 	struct Node *current = *head;
 
 	// Create the new node to append to the linked list
-	struct Node *new_node = malloc(sizeof(*new_node));
+	struct Node *new_node = (struct Node *) malloc(sizeof(*new_node));
 	new_node->address = addr;
 	new_node->next = NULL;
 
@@ -291,7 +291,7 @@ uint64_t find_closest_slice(void *va)
         keep_running = false;
         pthread_join(thread_l, NULL);
 
-        printf("  cpu %d elapsed %ld\n",probe_cpu,ji_p.elapsed);
+        // printf("  cpu %d elapsed %ld\n",probe_cpu,ji_p.elapsed);
         if (ji_p.elapsed < shortest_time) {
             shortest_time = ji_p.elapsed;
             shortest_cpu = probe_cpu;
@@ -303,13 +303,14 @@ uint64_t find_closest_slice(void *va)
 
 uint64_t get_cache_slice_index(void *va)
 {
-	uint64_t t1 = find_closest_slice(va);
-	uint64_t t2 = find_closest_slice(va);
+	while(1) {
+		uint64_t t1 = find_closest_slice(va);
+		uint64_t t2 = find_closest_slice(va);
 
-	if(t1!= t2)
-		printf("mismatch! address %p core %ld - %ld\n",va,t1,t2); 
-	
-	return t1;
+		if(t1!= t2)
+			printf("mismatch! address %p core %ld - %ld\n",va,t1,t2); 
+		else return t1;
+	}
 }
 
 void flush_l1i(void)

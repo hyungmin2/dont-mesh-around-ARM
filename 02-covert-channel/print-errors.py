@@ -95,8 +95,8 @@ def per_offset_worker(parse_params):
     # lower threshold than with shorter intervals).
     # We try different fractions of contention samples observed (e.g. 10% of the
     # samples must show contention for the bit to be counted as a 1)
-    thresholds = range(70, 120, 2)	# FIXME: adjust these thresholds for your CPU
-    contention_fracs = range(1, 70, 4) # test from 0.01 to 0.7 in intervals of 0.04
+    thresholds = range(3, 6, 1)	# FIXME: adjust these thresholds for your CPU
+    contention_fracs = range(1, 100, 1) # test from 0.01 to 0.7 in intervals of 0.04
 
     best_contention_frac = None
     best_threshold = None

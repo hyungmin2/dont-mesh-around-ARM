@@ -1,14 +1,14 @@
 #!/bin/bash
 cd "${BASH_SOURCE%/*}/" || exit # cd into correct directory
 
-CPU_GHZ=2.2
+CPU_GHZ=0.125
 
 rm -rf out/capacity-data.out
 ./setup.sh
 
 for ITERATION in {1..5}; do
 	echo Iteration $ITERATION
-	for BITRATE in 0.5 1 1.5 2 2.5 3 3.5 4 4.5 5 5.5 6 6.5 7 7.5 8; do
+	for BITRATE in 0.1 0.2 0.3 0.4 0.5; do
 		
 		# Compute interval for the desired bitrate
 		source ../venv/bin/activate
@@ -21,9 +21,10 @@ for ITERATION in {1..5}; do
 
 		# Run
 		until
-			sudo ./bin/transmitter-rand-bits 8 5 $INTERVAL > /dev/null &
+			echo "INTERVAL " $INTERVAL
+			sudo ./bin/transmitter-rand-bits 0 16 $INTERVAL > /dev/null &
 			sleep 1
-			sudo ./bin/receiver-no-ev 7 6 ./out/receiver-contention.out $INTERVAL > /dev/null
+			sudo ./bin/receiver-no-ev 2 18 ./out/receiver-contention.out $INTERVAL > /dev/null
 		do
 			echo "Repeating iteration because it failed"
 			sudo killall transmitter-rand-bits &> /dev/null
